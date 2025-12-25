@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-GA v3.1 — Optimizer-only GA for Instant-NGP (baseline, non-stagnating).
+GA v3.1 — Learning-rate–only Genetic Algorithm for Instant-NGP
+Fitness = single-frame PSNR via run_one_frame_psnr.py
 
-Search space:
-- learning_rate
-- l2_reg
+Place at:
+  instant-ngp/scripts/ga_v3_1_lr_only.py
 
-Evaluation:
-- Train N steps
-- Render ONE fixed frame
-- Compute PSNR via run_one_frame_psnr.py
-
-This script intentionally avoids pyngp internals.
+Run from project root:
+  python instant-ngp/scripts/ga_v3_1_lr_only.py ...
 """
 
 import argparse
@@ -22,101 +18,84 @@ import random
 import subprocess
 import math
 import csv
+import re
 from copy import deepcopy
 
-# -------------------------
-# Search ranges (SAFE)
-# -------------------------
-LR_RANGE = (1e-4, 5e-2)      # log-uniform
-L2_RANGE = (0.0, 1e-4)       # uniform
+# ------------------------------------------------------------
+# PSNR extraction (FIXED — this was your bug)
+# ------------------------------------------------------------
+def extract_psnr(output: str):
+    # Primary pattern (your evaluator prints this)
+    m = re.search(
+        r"PSNR\s*\(frame\s*\d+\)\s*===\s*([0-9eE+\-.]+)",
+        output
+    )
+    if m:
+        return float(m.group(1))
 
-OPTIMIZER_PATH = ["optimizer", "nested", "nested"]  # Adam block
+    # Fallbacks
+    m = re.search(r"PSNR\s*[:=]\s*([0-9eE+\-.]+)", output, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
 
-# -------------------------
-# JSON helpers
-# -------------------------
-def deep_get(d, path):
-    cur = d
-    for p in path:
-        if not isinstance(cur, dict):
-            return {}
-        cur = cur.get(p, {})
-    return cur
+    return None
 
-def deep_set(d, path, value):
-    cur = d
-    for p in path[:-1]:
-        if p not in cur or not isinstance(cur[p], dict):
-            cur[p] = {}
-        cur = cur[p]
-    cur[path[-1]] = value
 
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+# ------------------------------------------------------------
+# Optimizer-only genome
+# ------------------------------------------------------------
+def random_genome():
+    return {
+        "learning_rate": 10 ** random.uniform(-4, -1.3),  # ~1e-4 to 5e-2
+        "l2_reg": 10 ** random.uniform(-8, -4)
+    }
 
-def log_uniform(lo, hi):
-    return math.exp(random.uniform(math.log(lo), math.log(hi)))
 
-# -------------------------
-# Genome
-# -------------------------
-def sample_individual(base_cfg):
+def mutate(genome, rate=0.2):
+    g = genome.copy()
+    if random.random() < rate:
+        g["learning_rate"] *= math.exp(random.uniform(-0.3, 0.3))
+        g["learning_rate"] = min(max(g["learning_rate"], 1e-5), 5e-2)
+
+    if random.random() < rate:
+        g["l2_reg"] *= math.exp(random.uniform(-0.5, 0.5))
+        g["l2_reg"] = min(max(g["l2_reg"], 0.0), 1e-3)
+
+    return g
+
+
+# ------------------------------------------------------------
+# Apply genome to base.json
+# ------------------------------------------------------------
+def apply_genome(base_cfg, genome):
     cfg = deepcopy(base_cfg)
-    opt = deep_get(cfg, OPTIMIZER_PATH)
-    opt = dict(opt)
 
-    opt["learning_rate"] = float(log_uniform(*LR_RANGE))
-    opt["l2_reg"] = float(random.uniform(*L2_RANGE))
+    # Adam optimizer path used by instant-ngp base.json
+    opt = cfg.setdefault("optimizer", {})
+    nested = opt.setdefault("nested", {})
+    inner = nested.setdefault("nested", {})
 
-    deep_set(cfg, OPTIMIZER_PATH, opt)
+    inner["otype"] = "Adam"
+    inner["learning_rate"] = float(genome["learning_rate"])
+    inner["l2_reg"] = float(genome["l2_reg"])
+
     return cfg
 
-def mutate(ind, rate=0.3):
-    cfg = deepcopy(ind)
-    opt = deep_get(cfg, OPTIMIZER_PATH)
-    opt = dict(opt)
 
-    if random.random() < 0.8:
-        factor = math.exp(random.uniform(-rate, rate))
-        opt["learning_rate"] = float(
-            max(LR_RANGE[0], min(LR_RANGE[1], opt["learning_rate"] * factor))
-        )
-
-    if random.random() < 0.5:
-        opt["l2_reg"] = float(
-            max(L2_RANGE[0], min(L2_RANGE[1], opt["l2_reg"] + random.uniform(-1e-5, 1e-5)))
-        )
-
-    deep_set(cfg, OPTIMIZER_PATH, opt)
-    return cfg
-
-def crossover(a, b):
-    cfg = deepcopy(a)
-    opt_a = deep_get(a, OPTIMIZER_PATH)
-    opt_b = deep_get(b, OPTIMIZER_PATH)
-
-    opt = {}
-    opt["learning_rate"] = random.choice([opt_a["learning_rate"], opt_b["learning_rate"]])
-    opt["l2_reg"] = random.choice([opt_a["l2_reg"], opt_b["l2_reg"]])
-
-    deep_set(cfg, OPTIMIZER_PATH, opt)
-    return cfg
-
-# -------------------------
-# Fitness evaluation
-# -------------------------
-def evaluate(scene, cfg_path, steps, frame_idx, width, height, spp, timeout):
+# ------------------------------------------------------------
+# Run evaluator
+# ------------------------------------------------------------
+def evaluate(scene, cfg_path, args):
     cmd = [
         sys.executable,
-        os.path.join("scripts", "run_one_frame_psnr.py"),
+        os.path.join("instant-ngp", "scripts", "run_one_frame_psnr.py"),
         "--scene", scene,
         "--config", cfg_path,
-        "--steps", str(steps),
-        "--frame_idx", str(frame_idx),
-        "--width", str(width),
-        "--height", str(height),
-        "--spp", str(spp),
+        "--steps", str(args.eval_steps),
+        "--frame_idx", str(args.frame_idx),
+        "--width", str(args.eval_width),
+        "--height", str(args.eval_height),
+        "--spp", str(args.eval_spp),
     ]
 
     proc = subprocess.run(
@@ -124,117 +103,105 @@ def evaluate(scene, cfg_path, steps, frame_idx, width, height, spp, timeout):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        timeout=timeout,
+        timeout=args.eval_timeout
     )
 
-    out = proc.stdout
-    psnr = None
+    psnr = extract_psnr(proc.stdout)
+    return psnr, proc.stdout
 
-    for line in out.splitlines():
-        if "PSNR" in line:
-            try:
-                psnr = float(line.strip().split()[-1])
-            except Exception:
-                pass
 
-    return psnr, out
-
-# -------------------------
+# ------------------------------------------------------------
 # GA loop
-# -------------------------
+# ------------------------------------------------------------
 def run_ga(args):
     random.seed(args.seed)
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    with open(args.base, "r") as f:
+    with open(args.base) as f:
         base_cfg = json.load(f)
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    population = [random_genome() for _ in range(args.pop_size)]
+    best_psnr = -1e9
+    best_genome = None
+
     csv_path = os.path.join(args.out_dir, "ga_log.csv")
-
-    pop = [sample_individual(base_cfg) for _ in range(args.pop_size)]
-
-    with open(csv_path, "w", newline="") as cf:
-        writer = csv.writer(cf)
-        writer.writerow(["gen", "idx", "psnr", "lr", "l2", "cfg_path"])
-
-        best_psnr = -1e9
-        best_cfg = None
+    with open(csv_path, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["generation", "idx", "psnr", "learning_rate", "l2_reg"])
 
         for gen in range(1, args.generations + 1):
             print(f"\n=== Generation {gen}/{args.generations} ===")
             scored = []
 
-            gen_dir = os.path.join(args.out_dir, f"gen{gen:02d}")
-            os.makedirs(gen_dir, exist_ok=True)
+            for i, genome in enumerate(population):
+                cfg = apply_genome(base_cfg, genome)
+                cfg_path = os.path.join(args.out_dir, f"gen{gen:02d}_ind{i:02d}.json")
 
-            for i, ind in enumerate(pop):
-                cfg_path = os.path.join(gen_dir, f"ind{i:02d}.json")
-                save_json(cfg_path, ind)
+                with open(cfg_path, "w") as f:
+                    json.dump(cfg, f, indent=2)
 
-                psnr, out = evaluate(
-                    args.scene, cfg_path,
-                    args.eval_steps,
-                    args.frame_idx,
-                    args.eval_width,
-                    args.eval_height,
-                    args.eval_spp,
-                    args.eval_timeout
+                psnr, out = evaluate(args.scene, cfg_path, args)
+                print(
+                    f"Ind {i:02d} | PSNR={psnr} | "
+                    f"lr={genome['learning_rate']:.2e} "
+                    f"l2={genome['l2_reg']:.2e}"
                 )
 
-                lr = deep_get(ind, OPTIMIZER_PATH).get("learning_rate")
-                l2 = deep_get(ind, OPTIMIZER_PATH).get("l2_reg")
+                writer.writerow([gen, i, psnr, genome["learning_rate"], genome["l2_reg"]])
+                csvfile.flush()
 
-                print(f"Ind {i:02d} | PSNR={psnr} | lr={lr:.2e} l2={l2:.2e}")
-                writer.writerow([gen, i, psnr, lr, l2, cfg_path])
-                cf.flush()
+                if psnr is not None:
+                    scored.append((psnr, genome))
+                    if psnr > best_psnr:
+                        best_psnr = psnr
+                        best_genome = genome
+                        with open(os.path.join(args.out_dir, "best_ga_config.json"), "w") as bf:
+                            json.dump(cfg, bf, indent=2)
 
-                if psnr is not None and psnr > best_psnr:
-                    best_psnr = psnr
-                    best_cfg = deepcopy(ind)
-                    save_json(os.path.join(args.out_dir, "best_ga_config.json"), best_cfg)
-                    print(f" NEW BEST PSNR={psnr:.4f}")
+            # Selection
+            if scored:
+                scored.sort(reverse=True, key=lambda x: x[0])
+                elites = [scored[0][1]]
+            else:
+                elites = [random_genome()]
 
-                scored.append((psnr if psnr is not None else -1e9, ind))
-
-            scored.sort(key=lambda x: x[0], reverse=True)
-
-            elites = [deepcopy(scored[i][1]) for i in range(args.elite_count)]
-            next_pop = elites[:]
-
+            # Reproduce
+            next_pop = elites.copy()
             while len(next_pop) < args.pop_size:
-                a = random.choice(elites)
-                b = random.choice(scored)[1]
-                child = crossover(a, b)
-                child = mutate(child, args.mutation_rate)
+                parent = random.choice(elites)
+                child = mutate(parent, args.mutation_rate)
                 next_pop.append(child)
 
-            pop = next_pop
+            population = next_pop
 
     print("\n=== GA finished ===")
     print("Best PSNR:", best_psnr)
+    print("Best genome:", best_genome)
 
-# -------------------------
+
+# ------------------------------------------------------------
 # CLI
-# -------------------------
-def main():
+# ------------------------------------------------------------
+def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--scene", required=True)
     p.add_argument("--base", required=True)
     p.add_argument("--out_dir", required=True)
+
     p.add_argument("--pop_size", type=int, default=8)
     p.add_argument("--generations", type=int, default=6)
-    p.add_argument("--elite_count", type=int, default=1)
     p.add_argument("--mutation_rate", type=float, default=0.3)
-    p.add_argument("--eval_steps", type=int, default=3000)
+
+    p.add_argument("--eval_steps", type=int, default=2000)
     p.add_argument("--eval_width", type=int, default=64)
     p.add_argument("--eval_height", type=int, default=64)
     p.add_argument("--eval_spp", type=int, default=1)
     p.add_argument("--eval_timeout", type=int, default=1200)
     p.add_argument("--frame_idx", type=int, default=0)
-    p.add_argument("--seed", type=int, default=42)
-    args = p.parse_args()
 
-    run_ga(args)
+    p.add_argument("--seed", type=int, default=1337)
+    return p.parse_args()
+
 
 if __name__ == "__main__":
-    main()
+    run_ga(parse_args())
